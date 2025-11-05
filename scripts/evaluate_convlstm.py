@@ -90,17 +90,18 @@ def evaluate_model(model, dataloader, normalizer, device, output_dir):
             x = normalizer.normalize(x)
             
             # Forward pass
-            predictions = model(x, mask)  # (batch, 1)
+            predictions = model(x, mask)  # (batch, seq_len, 1)
             
             # Get targets (last timestep)
-            targets = y[:, -1].unsqueeze(1)  # (batch, 1)
+            pred_last = predictions[:, -1, 0]  # (batch,)
+            target_last = y[:, -1]  # (batch,)
             
             # Store results for each basin in batch
             for i in range(len(basin_ids)):
                 results.append({
                     'basin_id': basin_ids[i],
-                    'prediction': predictions[i, 0].cpu().item(),
-                    'target': targets[i, 0].cpu().item()
+                    'prediction': pred_last[i].cpu().item(),
+                    'target': target_last[i].cpu().item()
                 })
     
     # Convert to DataFrame

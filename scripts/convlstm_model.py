@@ -4,8 +4,12 @@ ConvLSTM Model for Spatial-Temporal Runoff Prediction
 Architecture A: ConvLSTM Encoder ? Global Pooling ? MLP
 - Input: (batch, seq_len, channels, height, width)
 - ConvLSTM: Extract spatial-temporal features
-- Masked Global Average Pooling: Aggregate spatial info (respecting basin mask)
+- Global Average Pooling: Aggregate spatial info (NO MASK - simple average)
 - MLP: Predict scalar runoff value
+
+CHANGES FROM ORIGINAL:
+1. Removed mask-based pooling
+2. Using simple global average pooling over all 61x61 pixels
 """
 
 import torch
@@ -189,13 +193,12 @@ class ConvLSTM(nn.Module):
 
 class SpatialRunoffModel(nn.Module):
     """
-    Complete model: ConvLSTM ? Masked Pooling ? MLP ? Runoff prediction.
+    Complete model: ConvLSTM ? Global Pooling ? MLP ? Runoff prediction.
     
     Architecture:
         1. ConvLSTM: Extract spatial-temporal features
-        2. Take last timestep output
-        3. Masked global average pooling
-        4. MLP to predict runoff
+        2. For each timestep: Global average pooling (NO MASK)
+        3. MLP to predict runoff
     """
     
     def __init__(
@@ -245,14 +248,14 @@ class SpatialRunoffModel(nn.Module):
         
         self.mlp = nn.Sequential(*mlp_layers)
     
-    def forward(self, x, mask):
+    def forward(self, x, mask=None):
         """
         Args:
             x: (batch, seq_len, channels, height, width) - input sequence
-            mask: (batch, height, width) - basin mask (1=valid, 0=invalid)
+            mask: IGNORED (kept for backward compatibility)
         
         Returns:
-            output: (batch, 1) - predicted runoff for each basin
+            output: (batch, seq_len, 1) - predicted runoff for ALL timesteps
         """
         batch_size, seq_len, channels, height, width = x.size()
         
@@ -262,27 +265,26 @@ class SpatialRunoffModel(nn.Module):
         # Get output from last layer: (batch, seq_len, hidden_dim, H, W)
         convlstm_output = layer_output_list[0]
         
-        # Take last timestep: (batch, hidden_dim, H, W)
-        last_output = convlstm_output[:, -1, :, :, :]
+        # CRITICAL: Pool EACH timestep separately (not just last one!)
+        # This matches NeuralHydrology's approach where head sees all timesteps
         
-        # Masked global average pooling
-        # Expand mask dimensions: (batch, 1, H, W)
-        mask_expanded = mask.unsqueeze(1)
+        pooled_sequence = []
         
-        # Mask the features
-        masked_features = last_output * mask_expanded  # (batch, hidden_dim, H, W)
+        for t in range(seq_len):
+            # Get features at timestep t: (batch, hidden_dim, H, W)
+            features_t = convlstm_output[:, t, :, :, :]
+            
+            # Simple global average pooling (NO MASK!)
+            pooled_t = features_t.mean(dim=(-2, -1))  # (batch, hidden_dim)
+            
+            pooled_sequence.append(pooled_t)
         
-        # Sum over spatial dimensions
-        spatial_sum = masked_features.sum(dim=(-2, -1))  # (batch, hidden_dim)
+        # Stack all timesteps: (batch, seq_len, hidden_dim)
+        pooled = torch.stack(pooled_sequence, dim=1)
         
-        # Count valid pixels per batch
-        valid_pixels = mask_expanded.sum(dim=(-2, -1))  # (batch, 1)
-        
-        # Average (avoid division by zero)
-        pooled = spatial_sum / (valid_pixels + 1e-8)  # (batch, hidden_dim)
-        
-        # Pass through MLP
-        output = self.mlp(pooled)  # (batch, 1)
+        # Pass ENTIRE SEQUENCE through MLP (like NeuralHydrology does)
+        # MLP is applied independently to each timestep
+        output = self.mlp(pooled)  # (batch, seq_len, 1)
         
         return output
 
@@ -297,7 +299,6 @@ if __name__ == "__main__":
     width = 61
     
     x = torch.randn(batch_size, seq_len, channels, height, width)
-    mask = torch.randint(0, 2, (batch_size, height, width)).float()
     
     # Create model
     model = SpatialRunoffModel(
@@ -308,10 +309,9 @@ if __name__ == "__main__":
         dropout=0.2
     )
     
-    # Forward pass
-    output = model(x, mask)
+    # Forward pass (no mask needed!)
+    output = model(x)
     
     print(f"Input shape: {x.shape}")
-    print(f"Mask shape: {mask.shape}")
     print(f"Output shape: {output.shape}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")

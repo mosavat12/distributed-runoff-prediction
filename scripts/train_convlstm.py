@@ -1,12 +1,15 @@
 """
 Training Script for Spatial-Temporal Runoff Prediction with ConvLSTM
 
+UPDATED VERSION with CSV logging for easy metric tracking
+
 Features:
 - Proper basin shuffling in batches
-- Normalization using training statistics
+- Normalization of BOTH inputs AND targets
 - Learning rate scheduling
 - Checkpointing
-- Logging with tensorboard
+- Logging with tensorboard AND CSV
+- NaN handling in inputs
 """
 
 import torch
@@ -20,6 +23,7 @@ import argparse
 import json
 from tqdm import tqdm
 import time
+import csv
 
 from spatial_dataset import SpatialHydroDataset, get_basin_list
 from convlstm_model import SpatialRunoffModel
@@ -27,17 +31,19 @@ from convlstm_model import SpatialRunoffModel
 
 class Normalizer:
     """
-    Handles normalization of input features.
+    Handles normalization of input features AND targets.
     Computes statistics from training data and applies to train/test.
     """
     
     def __init__(self):
-        self.means = None
-        self.stds = None
+        self.input_means = None
+        self.input_stds = None
+        self.target_mean = None
+        self.target_std = None
     
     def fit(self, dataset, num_samples=100):
         """
-        Compute mean and std from training dataset.
+        Compute mean and std from training dataset for BOTH inputs and targets.
         
         Args:
             dataset: Training dataset
@@ -45,44 +51,53 @@ class Normalizer:
         """
         print("Computing normalization statistics...")
         
-        all_values = []
+        all_input_values = []
+        all_target_values = []
         num_samples = min(num_samples, len(dataset))
         
         # Sample random basins
         indices = np.random.choice(len(dataset), num_samples, replace=False)
         
         for idx in tqdm(indices, desc="Sampling basins"):
-            x, _, _, _ = dataset[idx]  # x shape: (seq_len, channels, H, W)
-            all_values.append(x.numpy())
+            x, y, _, _ = dataset[idx]  # x: (seq_len, channels, H, W), y: (seq_len,)
+            all_input_values.append(x.numpy())
+            all_target_values.append(y.numpy())
         
+        # === INPUT NORMALIZATION ===
         # Stack all samples: (num_samples * seq_len, channels, H, W)
-        all_values = np.concatenate(all_values, axis=0)
+        all_input_values = np.concatenate(all_input_values, axis=0)
         
         # Compute per-channel statistics
-        # Mean and std over (samples, height, width) dimensions
-        self.means = np.nanmean(all_values, axis=(0, 2, 3))  # Use nanmean to handle NaN
-        self.stds = np.nanstd(all_values, axis=(0, 2, 3))    # Use nanstd to handle NaN
+        self.input_means = np.nanmean(all_input_values, axis=(0, 2, 3))
+        self.input_stds = np.nanstd(all_input_values, axis=(0, 2, 3))
         
         # Replace any remaining NaN or zero std with safe values
-        self.means = np.nan_to_num(self.means, nan=0.0)
-        self.stds = np.nan_to_num(self.stds, nan=1.0)
+        self.input_means = np.nan_to_num(self.input_means, nan=0.0)
+        self.input_stds = np.nan_to_num(self.input_stds, nan=1.0)
+        self.input_stds = np.maximum(self.input_stds, 1e-8)
         
-        # Ensure no zero std (would cause division by zero)
-        self.stds = np.maximum(self.stds, 1e-8)
+        # === TARGET NORMALIZATION ===
+        all_target_values = np.concatenate(all_target_values, axis=0)
+        self.target_mean = float(np.nanmean(all_target_values))
+        self.target_std = float(np.nanstd(all_target_values))
+        
+        # Ensure no zero std
+        if self.target_std < 1e-8:
+            self.target_std = 1.0
         
         print(f"Normalization stats computed from {num_samples} basins")
-        print(f"  Mean range: [{self.means.min():.4f}, {self.means.max():.4f}]")
-        print(f"  Std range: [{self.stds.min():.4f}, {self.stds.max():.4f}]")
+        print(f"  INPUT - Mean range: [{self.input_means.min():.4f}, {self.input_means.max():.4f}]")
+        print(f"  INPUT - Std range: [{self.input_stds.min():.4f}, {self.input_stds.max():.4f}]")
+        print(f"  TARGET - Mean: {self.target_mean:.4f}, Std: {self.target_std:.4f}")
         
-        # Check for any problematic channels
-        problematic = np.where((self.stds < 1e-6) | np.isnan(self.means) | np.isnan(self.stds))[0]
+        # Check for problematic channels
+        problematic = np.where((self.input_stds < 1e-6) | np.isnan(self.input_means) | np.isnan(self.input_stds))[0]
         if len(problematic) > 0:
             print(f"  WARNING: Channels with low/zero variance or NaN: {problematic.tolist()}")
-            print(f"  These channels may be constant or contain NaN values")
     
-    def normalize(self, x):
+    def normalize_inputs(self, x):
         """
-        Normalize input tensor.
+        Normalize input tensor with NaN handling.
         
         Args:
             x: (batch, seq_len, channels, H, W) or (seq_len, channels, H, W)
@@ -90,38 +105,61 @@ class Normalizer:
         Returns:
             Normalized tensor (same shape as input)
         """
-        if self.means is None or self.stds is None:
+        if self.input_means is None or self.input_stds is None:
             raise ValueError("Normalizer not fitted. Call fit() first.")
+        
+        # Handle NaNs BEFORE normalization (replace with 0)
+        x = torch.nan_to_num(x, nan=0.0)
         
         # Reshape stats for broadcasting
         if x.dim() == 5:  # (batch, seq_len, channels, H, W)
-            means = torch.from_numpy(self.means).view(1, 1, -1, 1, 1).to(x.device)
-            stds = torch.from_numpy(self.stds).view(1, 1, -1, 1, 1).to(x.device)
+            means = torch.from_numpy(self.input_means).view(1, 1, -1, 1, 1).to(x.device)
+            stds = torch.from_numpy(self.input_stds).view(1, 1, -1, 1, 1).to(x.device)
         elif x.dim() == 4:  # (seq_len, channels, H, W)
-            means = torch.from_numpy(self.means).view(1, -1, 1, 1).to(x.device)
-            stds = torch.from_numpy(self.stds).view(1, -1, 1, 1).to(x.device)
+            means = torch.from_numpy(self.input_means).view(1, -1, 1, 1).to(x.device)
+            stds = torch.from_numpy(self.input_stds).view(1, -1, 1, 1).to(x.device)
         else:
             raise ValueError(f"Unexpected input dimensions: {x.dim()}")
         
         return (x - means) / stds
     
+    def normalize_targets(self, y):
+        """Normalize target tensor."""
+        if self.target_mean is None or self.target_std is None:
+            raise ValueError("Normalizer not fitted. Call fit() first.")
+        
+        return (y - self.target_mean) / self.target_std
+    
+    def denormalize_targets(self, y_norm):
+        """Denormalize target tensor back to original scale."""
+        if self.target_mean is None or self.target_std is None:
+            raise ValueError("Normalizer not fitted. Call fit() first.")
+        
+        return y_norm * self.target_std + self.target_mean
+    
     def save(self, path):
         """Save normalization statistics."""
-        np.savez(path, means=self.means, stds=self.stds)
+        np.savez(
+            path, 
+            input_means=self.input_means, 
+            input_stds=self.input_stds,
+            target_mean=self.target_mean,
+            target_std=self.target_std
+        )
         print(f"Saved normalization stats to {path}")
     
     def load(self, path):
         """Load normalization statistics."""
         data = np.load(path)
-        self.means = data['means']
-        self.stds = data['stds']
+        self.input_means = data['input_means']
+        self.input_stds = data['input_stds']
+        self.target_mean = float(data['target_mean'])
+        self.target_std = float(data['target_std'])
         print(f"Loaded normalization stats from {path}")
 
 
 def train_epoch(model, dataloader, criterion, optimizer, normalizer, device, epoch):
-    """
-    Train for one epoch.
-    """
+    """Train for one epoch."""
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -132,28 +170,25 @@ def train_epoch(model, dataloader, criterion, optimizer, normalizer, device, epo
         # Move to device
         x = x.to(device)  # (batch, seq_len, channels, H, W)
         y = y.to(device)  # (batch, seq_len)
-        mask = mask.to(device)  # (batch, H, W)
         
-        # Normalize inputs
-        x = normalizer.normalize(x)
+        # Normalize inputs AND targets
+        x = normalizer.normalize_inputs(x)
+        y_norm = normalizer.normalize_targets(y)
         
-        # Forward pass
+        # Forward pass (no mask!)
         optimizer.zero_grad()
-        predictions = model(x, mask)  # (batch, 1)
+        predictions = model(x)  # (batch, seq_len, 1)
         
-        # Take last timestep of target for prediction
-        # (You can also predict entire sequence - modify as needed)
-        target = y[:, -1].unsqueeze(1)  # (batch, 1)
+        # Take last timestep for prediction
+        pred_last = predictions[:, -1, 0]  # (batch,)
+        target_last = y_norm[:, -1]  # (batch,) - using NORMALIZED targets
         
-        # Compute loss
-        loss = criterion(predictions, target)
+        # Compute loss on NORMALIZED scale
+        loss = criterion(pred_last, target_last)
         
         # Backward pass
         loss.backward()
-        
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
         optimizer.step()
         
         # Update metrics
@@ -167,9 +202,7 @@ def train_epoch(model, dataloader, criterion, optimizer, normalizer, device, epo
 
 
 def validate(model, dataloader, criterion, normalizer, device):
-    """
-    Validate the model.
-    """
+    """Validate the model."""
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -182,28 +215,35 @@ def validate(model, dataloader, criterion, normalizer, device):
             # Move to device
             x = x.to(device)
             y = y.to(device)
-            mask = mask.to(device)
             
-            # Normalize inputs
-            x = normalizer.normalize(x)
+            # Normalize inputs AND targets
+            x = normalizer.normalize_inputs(x)
+            y_norm = normalizer.normalize_targets(y)
             
-            # Forward pass
-            predictions = model(x, mask)
-            target = y[:, -1].unsqueeze(1)
+            # Forward pass (no mask!)
+            predictions = model(x)  # (batch, seq_len, 1)
             
-            # Compute loss
-            loss = criterion(predictions, target)
+            # Take last timestep
+            pred_last_norm = predictions[:, -1, 0]  # (batch,) - normalized prediction
+            target_last_norm = y_norm[:, -1]  # (batch,) - normalized target
+            
+            # Compute loss on normalized scale
+            loss = criterion(pred_last_norm, target_last_norm)
             
             total_loss += loss.item()
             num_batches += 1
             
-            # Store for metrics
-            all_predictions.append(predictions.cpu().numpy())
-            all_targets.append(target.cpu().numpy())
+            # Denormalize for metrics
+            pred_last = normalizer.denormalize_targets(pred_last_norm)
+            target_last = y[:, -1]  # Original scale
+            
+            # Store denormalized values for metrics
+            all_predictions.append(pred_last.cpu().numpy())
+            all_targets.append(target_last.cpu().numpy())
     
     avg_loss = total_loss / num_batches
     
-    # Compute additional metrics
+    # Compute additional metrics on ORIGINAL scale
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
     
@@ -225,6 +265,15 @@ def main(args):
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ===== CREATE CSV LOGGER =====
+    csv_path = output_dir / 'training_log.csv'
+    csv_file = open(csv_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['Epoch', 'Train_Loss', 'Val_Loss', 'Val_NSE', 'Learning_Rate', 'Time_seconds'])
+    csv_file.flush()
+    print(f"CSV logger initialized: {csv_path}")
+    # =============================
     
     # Save configuration
     with open(output_dir / 'config.json', 'w') as f:
@@ -250,10 +299,9 @@ def main(args):
         train=True,
         mask_channel=args.mask_channel,
         seed=args.seed,
-        time_range=None  # Use all training data (10 years)
+        time_range=None
     )
     
-    # Validation dataset: Use FIRST 5 years of test period (days 0-1824)
     val_dataset = SpatialHydroDataset(
         basin_list=test_basins,
         data_dir=args.data_dir,
@@ -261,19 +309,19 @@ def main(args):
         train=False,
         mask_channel=args.mask_channel,
         seed=args.seed,
-        time_range=(0, 1825)  # First 5 years for validation
+        time_range=(0, 1825)
     )
     
-    # Create data loaders with shuffling
+    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,  # CRITICAL: Shuffle basins so model doesn't learn basin order
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True
     )
     
-    test_loader = DataLoader(
+    val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
@@ -335,7 +383,7 @@ def main(args):
         
         # Validate
         val_loss, val_nse = validate(
-            model, test_loader, criterion, normalizer, device
+            model, val_loader, criterion, normalizer, device
         )
         
         epoch_time = time.time() - epoch_start
@@ -345,12 +393,24 @@ def main(args):
         scheduler.step(val_loss)
         new_lr = optimizer.param_groups[0]['lr']
         
-        # Log metrics
+        # Log metrics to tensorboard
         current_lr = optimizer.param_groups[0]['lr']
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('NSE/val', val_nse, epoch)
         writer.add_scalar('LearningRate', current_lr, epoch)
+        
+        # ===== LOG TO CSV =====
+        csv_writer.writerow([
+            epoch,
+            f"{train_loss:.6f}",
+            f"{val_loss:.6f}",
+            f"{val_nse:.4f}",
+            f"{current_lr:.2e}",
+            f"{epoch_time:.1f}"
+        ])
+        csv_file.flush()  # Write immediately to disk
+        # ======================
         
         print(f"\nEpoch {epoch}/{args.epochs} [{epoch_time:.1f}s]")
         print(f"  Train Loss: {train_loss:.6f}")
@@ -390,6 +450,11 @@ def main(args):
             print(f"\nEarly stopping triggered after {epoch} epochs")
             break
     
+    # ===== CLOSE CSV FILE =====
+    csv_file.close()
+    print(f"\n? Training log saved to: {csv_path}")
+    # ==========================
+    
     writer.close()
     print("\nTraining completed!")
     print(f"Best validation loss: {best_val_loss:.6f}")
@@ -411,7 +476,7 @@ if __name__ == "__main__":
     parser.add_argument('--seq_length', type=int, default=365,
                         help='Sequence length (days)')
     parser.add_argument('--mask_channel', type=int, default=31,
-                        help='Channel index for basin mask (0-indexed)')
+                        help='Channel index for basin mask (DEPRECATED - not used)')
     
     # Model arguments
     parser.add_argument('--hidden_dims', type=int, nargs='+', default=[64, 128, 64],
