@@ -1,19 +1,23 @@
 """
+Copyright (c) 2025, Mohammad Mosavat
+Email Address: smosavat@crimson.ua.edu
+All rights reserved.
+
+This code is released under MIT License
+
+Description:
 ConvLSTM Model for Spatial-Temporal Runoff Prediction
 
-Architecture A: ConvLSTM Encoder ? Global Pooling ? MLP
-- Input: (batch, seq_len, channels, height, width)
-- ConvLSTM: Extract spatial-temporal features
-- Global Average Pooling: Aggregate spatial info (NO MASK - simple average)
-- MLP: Predict scalar runoff value
-
-CHANGES FROM ORIGINAL:
-1. Removed mask-based pooling
-2. Using simple global average pooling over all 61x61 pixels
+OPTIMIZED VERSION:
+- Vectorized pooling operation (no Python loops)
+- Support for mixed precision training
+- Optional JIT compilation
+- Efficient tensor operations
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ConvLSTMCell(nn.Module):
@@ -85,9 +89,12 @@ class ConvLSTMCell(nn.Module):
         """Initialize hidden state."""
         height, width = image_size
         device = self.conv.weight.device
+        dtype = self.conv.weight.dtype  # Match dtype for mixed precision
         
-        h = torch.zeros(batch_size, self.hidden_dim, height, width, device=device)
-        c = torch.zeros(batch_size, self.hidden_dim, height, width, device=device)
+        h = torch.zeros(batch_size, self.hidden_dim, height, width, 
+                       device=device, dtype=dtype)
+        c = torch.zeros(batch_size, self.hidden_dim, height, width, 
+                       device=device, dtype=dtype)
         
         return (h, c)
 
@@ -195,10 +202,10 @@ class SpatialRunoffModel(nn.Module):
     """
     Complete model: ConvLSTM ? Global Pooling ? MLP ? Runoff prediction.
     
-    Architecture:
-        1. ConvLSTM: Extract spatial-temporal features
-        2. For each timestep: Global average pooling (NO MASK)
-        3. MLP to predict runoff
+    OPTIMIZED VERSION with:
+    - Vectorized pooling (no Python loops!)
+    - Mixed precision support
+    - Optional mask-weighted pooling
     """
     
     def __init__(
@@ -207,7 +214,8 @@ class SpatialRunoffModel(nn.Module):
         hidden_dims=[64, 128, 64],
         kernel_sizes=[5, 3, 3],
         mlp_hidden_dims=[128, 64],
-        dropout=0.2
+        dropout=0.2,
+        use_mask=False
     ):
         """
         Args:
@@ -216,9 +224,11 @@ class SpatialRunoffModel(nn.Module):
             kernel_sizes: List of kernel sizes for ConvLSTM layers
             mlp_hidden_dims: List of hidden dimensions for MLP
             dropout: Dropout rate
+            use_mask: If True, use mask for weighted pooling
         """
         super(SpatialRunoffModel, self).__init__()
         
+        self.use_mask = use_mask
         num_layers = len(hidden_dims)
         
         # ConvLSTM encoder
@@ -248,11 +258,12 @@ class SpatialRunoffModel(nn.Module):
         
         self.mlp = nn.Sequential(*mlp_layers)
     
+    @torch.cuda.amp.autocast()  # Enable automatic mixed precision
     def forward(self, x, mask=None):
         """
         Args:
             x: (batch, seq_len, channels, height, width) - input sequence
-            mask: IGNORED (kept for backward compatibility)
+            mask: (batch, height, width) - basin mask (optional)
         
         Returns:
             output: (batch, seq_len, 1) - predicted runoff for ALL timesteps
@@ -265,53 +276,102 @@ class SpatialRunoffModel(nn.Module):
         # Get output from last layer: (batch, seq_len, hidden_dim, H, W)
         convlstm_output = layer_output_list[0]
         
-        # CRITICAL: Pool EACH timestep separately (not just last one!)
-        # This matches NeuralHydrology's approach where head sees all timesteps
-        
-        pooled_sequence = []
-        
-        for t in range(seq_len):
-            # Get features at timestep t: (batch, hidden_dim, H, W)
-            features_t = convlstm_output[:, t, :, :, :]
+        # OPTIMIZED: Vectorized pooling - no Python loops!
+        if self.use_mask and mask is not None:
+            # Expand mask for all timesteps and channels
+            # mask: (batch, H, W) ? (batch, 1, 1, H, W)
+            mask_expanded = mask.unsqueeze(1).unsqueeze(1)
             
-            # Simple global average pooling (NO MASK!)
-            pooled_t = features_t.mean(dim=(-2, -1))  # (batch, hidden_dim)
+            # Apply mask and compute weighted average
+            masked_output = convlstm_output * mask_expanded
             
-            pooled_sequence.append(pooled_t)
+            # Sum over spatial dimensions
+            spatial_sum = masked_output.sum(dim=(-2, -1))  # (batch, seq_len, hidden_dim)
+            
+            # Compute mask normalization factor
+            mask_sum = mask_expanded.sum(dim=(-2, -1)).clamp(min=1e-8)  # (batch, 1, 1)
+            
+            # Weighted average
+            pooled = spatial_sum / mask_sum
+        else:
+            # VECTORIZED: Simple global average pooling
+            # This single line replaces the entire Python loop!
+            pooled = convlstm_output.mean(dim=(-2, -1))  # (batch, seq_len, hidden_dim)
         
-        # Stack all timesteps: (batch, seq_len, hidden_dim)
-        pooled = torch.stack(pooled_sequence, dim=1)
+        # Pass ENTIRE SEQUENCE through MLP
+        # Reshape for batch processing through MLP
+        batch_seq_len = batch_size * seq_len
+        pooled_reshaped = pooled.reshape(batch_seq_len, -1)
         
-        # Pass ENTIRE SEQUENCE through MLP (like NeuralHydrology does)
-        # MLP is applied independently to each timestep
-        output = self.mlp(pooled)  # (batch, seq_len, 1)
+        # Apply MLP to all timesteps at once
+        output_reshaped = self.mlp(pooled_reshaped)  # (batch*seq_len, 1)
+        
+        # Reshape back to (batch, seq_len, 1)
+        output = output_reshaped.reshape(batch_size, seq_len, 1)
         
         return output
 
 
-# Test the model
+# Optional: JIT-compiled version for additional speedup
+def create_jit_model(**kwargs):
+    """
+    Create a JIT-compiled version of the model for production.
+    
+    Usage:
+        model = create_jit_model(input_channels=32, ...)
+        model = torch.jit.script(model)
+    """
+    model = SpatialRunoffModel(**kwargs)
+    # Note: JIT compilation happens when you call torch.jit.script(model)
+    return model
+
+
+# Test the optimized model
 if __name__ == "__main__":
+    import time
+    
     # Create sample data
-    batch_size = 4
+    batch_size = 32  # Increased from 4!
     seq_len = 365
     channels = 32
     height = 61
     width = 61
     
-    x = torch.randn(batch_size, seq_len, channels, height, width)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    x = torch.randn(batch_size, seq_len, channels, height, width).to(device)
+    mask = torch.ones(batch_size, height, width).to(device)
     
-    # Create model
+    # Create optimized model
     model = SpatialRunoffModel(
         input_channels=32,
         hidden_dims=[64, 128, 64],
         kernel_sizes=[5, 3, 3],
         mlp_hidden_dims=[128, 64],
-        dropout=0.2
-    )
+        dropout=0.2,
+        use_mask=False
+    ).to(device)
     
-    # Forward pass (no mask needed!)
-    output = model(x)
+    # Warmup
+    for _ in range(3):
+        _ = model(x, mask)
     
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {output.shape}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # Benchmark
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
+    start_time = time.time()
+    with torch.cuda.amp.autocast():  # Mixed precision
+        output = model(x, mask)
+    
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
+    elapsed = time.time() - start_time
+    
+    print(f"Optimized Model Performance:")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Input shape: {x.shape}")
+    print(f"  Output shape: {output.shape}")
+    print(f"  Forward pass time: {elapsed:.3f} seconds")
+    print(f"  Throughput: {batch_size/elapsed:.1f} basins/second")
+    print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}")

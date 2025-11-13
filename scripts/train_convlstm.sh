@@ -6,8 +6,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:1
-#SBATCH --mem=640G
-#SBATCH --time=200:00:00
+#SBATCH --exclude=uahpc-gpu008
+#SBATCH --mem=990G
+#SBATCH --time=240:00:00
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 
@@ -64,6 +65,8 @@ echo "Starting training with FIXED code (target normalization + no mask)..."
 echo "Output directory: $OUTPUT_DIR"
 echo ""
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 python train_convlstm.py \
     --data_dir $DATA_DIR \
     --train_basin_file $TRAIN_BASINS \
@@ -75,7 +78,8 @@ python train_convlstm.py \
     --kernel_sizes 5 3 3 \
     --mlp_hidden_dims 128 64 \
     --dropout 0.2 \
-    --batch_size 4 \
+    --gradient_accumulation 1 \
+    --batch_size 8 \
     --epochs 150 \
     --learning_rate 0.00005 \
     --patience 15 \

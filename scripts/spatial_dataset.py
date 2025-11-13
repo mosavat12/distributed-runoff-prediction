@@ -1,4 +1,14 @@
 """
+Copyright (c) 2025, Mohammad Mosavat
+Email Address: smosavat@crimson.ua.edu
+All rights reserved.
+
+This code is released under MIT License
+
+Description:
+ConvLSTM-based distributed hydrological model for runoff prediction.
+Training Script for Spatial-Temporal Runoff Prediction with ConvLSTM
+
 Custom Dataset for Spatial-Temporal Hydrological Data (ConvLSTM)
 
 This dataset handles:
@@ -7,6 +17,8 @@ This dataset handles:
 - Random temporal window sampling
 - Basin-level batching with shuffling
 - Lazy loading to handle large files
+
+FIXED: Properly implements time_range for train/test split
 """
 
 import numpy as np
@@ -37,7 +49,7 @@ class SpatialHydroDataset(Dataset):
         train=True,
         mask_channel=31,  # Which channel is the mask (0-indexed)
         seed=None,
-        time_range=None  # NEW: (start_day, end_day) or None for all days
+        time_range=None  # (start_day, end_day) or None for all days
     ):
         """
         Args:
@@ -56,7 +68,7 @@ class SpatialHydroDataset(Dataset):
         self.seq_length = seq_length
         self.train = train
         self.mask_channel = mask_channel
-        self.time_range = time_range  # NEW
+        self.time_range = time_range  # Store time range
         
         if seed is not None:
             random.seed(seed)
@@ -69,15 +81,7 @@ class SpatialHydroDataset(Dataset):
         else:
             self.input_dir = self.data_dir / 'test_final_inputs'
             self.target_dir = self.data_dir / 'test_targets'
-        
-        # Verify directories exist
-        assert self.input_dir.exists(), f"Input directory not found: {self.input_dir}"
-        assert self.target_dir.exists(), f"Target directory not found: {self.target_dir}"
-        
-        # Cache for loaded data (optional - remove if memory constrained)
-        self.data_cache = {}
-        self.use_cache = False  # Set to True if you want to cache loaded basins
-        
+                
         print(f"Initialized {'training' if train else 'test'} dataset")
         print(f"  Basins: {len(self.basin_list)}")
         print(f"  Sequence length: {self.seq_length}")
@@ -133,9 +137,6 @@ class SpatialHydroDataset(Dataset):
                 from scipy.interpolate import NearestNDInterpolator
                 interpolator = NearestNDInterpolator(valid_points, valid_values)
                 slice_2d[nan_mask] = interpolator(nan_points)
-            else:
-                # If all NaN, fill with 0
-                slice_2d[:] = 0.0
         
         # Broadcast the interpolated 2D slice to all timesteps
         channel_data[:, :, :] = slice_2d[:, :, np.newaxis]
@@ -147,13 +148,10 @@ class SpatialHydroDataset(Dataset):
         Load input and target data for a single basin.
         
         Returns:
-            inputs: (61, 61, 32, 3650) numpy array
-            targets: (3650,) numpy array
+            inputs: (61, 61, 32, valid_timesteps) numpy array
+            targets: (valid_timesteps,) numpy array
             mask: (61, 61) binary mask
         """
-        # Check cache first
-        if self.use_cache and basin_id in self.data_cache:
-            return self.data_cache[basin_id]
         
         # Load input .npy file
         input_file = self.input_dir / f"{basin_id}.npy"
@@ -161,6 +159,25 @@ class SpatialHydroDataset(Dataset):
             raise FileNotFoundError(f"Input file not found: {input_file}")
         
         inputs = np.load(input_file)  # Shape: (61, 61, 32, 3650)
+        
+        # Load target .csv file
+        target_file = self.target_dir / f"{basin_id}.csv"
+        if not target_file.exists():
+            raise FileNotFoundError(f"Target file not found: {target_file}")
+        
+        target_df = pd.read_csv(target_file)
+        targets = target_df['runoff'].values  # Shape: (3650,)
+        
+        # FIXED: Apply time_range if specified
+        if self.time_range is not None:
+            start_day, end_day = self.time_range
+            # Clip to valid range
+            start_day = max(0, start_day)
+            end_day = min(inputs.shape[3], end_day)
+            
+            # Extract time range
+            inputs = inputs[:, :, :, start_day:end_day]
+            targets = targets[start_day:end_day]
         
         # Interpolate MODIS channels (18-22) - these are STATIC variables
         # They don't change over time, so we only interpolate the 2D slice once
@@ -173,22 +190,6 @@ class SpatialHydroDataset(Dataset):
         # Ensure binary mask
         mask = (mask > 0).astype(np.float32)
         
-        # Load target .csv file
-        target_file = self.target_dir / f"{basin_id}.csv"
-        if not target_file.exists():
-            raise FileNotFoundError(f"Target file not found: {target_file}")
-        
-        target_df = pd.read_csv(target_file)
-        targets = target_df['runoff'].values  # Shape: (3650,)
-        
-        # Verify shapes
-        assert inputs.shape == (61, 61, 32, 3650), f"Unexpected input shape: {inputs.shape}"
-        assert targets.shape[0] == 3650, f"Unexpected target length: {targets.shape[0]}"
-        assert mask.shape == (61, 61), f"Unexpected mask shape: {mask.shape}"
-        
-        # Cache if enabled
-        if self.use_cache:
-            self.data_cache[basin_id] = (inputs, targets, mask)
         
         return inputs, targets, mask
     
@@ -204,29 +205,23 @@ class SpatialHydroDataset(Dataset):
         """
         basin_id = self.basin_list[idx]
         
-        # Load basin data
+        # Load basin data (already filtered by time_range if specified)
         inputs, targets, mask = self._load_basin_data(basin_id)
         
-        # inputs shape: (61, 61, 32, 3650)
+        # inputs shape: (61, 61, 32, available_timesteps)
         # We need: (seq_length, 32, 61, 61)
         
         total_timesteps = inputs.shape[3]
         
-        # Sample random start index for temporal window
-        if total_timesteps <= self.seq_length:
-            # If data shorter than seq_length, use all
-            start_idx = 0
-            end_idx = total_timesteps
-        else:
-            # Random window
-            start_idx = np.random.randint(0, total_timesteps - self.seq_length + 1)
-            end_idx = start_idx + self.seq_length
-        
-        # Extract temporal window and transpose to (time, channels, height, width)
+            # Random window within the time range
+        start_idx = np.random.randint(0, total_timesteps - self.seq_length + 1)
+        end_idx = start_idx + self.seq_length
+            
+            # Extract temporal window and transpose to (time, channels, height, width)
         x = inputs[:, :, :, start_idx:end_idx]  # (61, 61, 32, seq_length)
         x = np.transpose(x, (3, 2, 0, 1))  # (seq_length, 32, 61, 61)
-        
-        # Extract corresponding targets
+            
+            # Extract corresponding targets
         y = targets[start_idx:end_idx]  # (seq_length,)
         
         # Convert to PyTorch tensors
@@ -258,14 +253,16 @@ if __name__ == "__main__":
     data_dir = "/icebox/data/shares/mh2/mosavat/Distributed"
     
     # Create a small test list
-    test_basins = ["0101000101", "0101000102"]  # Replace with actual basin IDs
+    test_basins = ["0505000102"]  # Replace with actual basin IDs
     
+    # Test with time range
     dataset = SpatialHydroDataset(
         basin_list=test_basins,
         data_dir=data_dir,
         seq_length=365,
         train=True,
-        mask_channel=31
+        mask_channel=31,
+        time_range=(1825, 3650)  # Last 5 years for testing
     )
     
     # Test loading one sample
